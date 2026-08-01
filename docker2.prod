@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Production Dockerfile for the NestJS API.
+# Multi-stage: deps -> build -> runtime, so the final image ships only
+# production node_modules + compiled dist/, not devDependencies or source.
+# ---------------------------------------------------------------------------
+
+FROM node:20-alpine AS deps
+RUN apk add --no-cache openssl
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi
+
+FROM node:20-alpine AS build
+RUN apk add --no-cache openssl
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json package-lock.json* ./
+COPY prisma ./prisma
+RUN npx prisma generate
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine AS prod-deps
+RUN apk add --no-cache openssl
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN (if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi) && npm cache clean --force
+COPY prisma ./prisma
+RUN npx prisma generate
+
+FROM node:20-alpine AS runner
+# DOCKER_GID must match the GID of /var/run/docker.sock on the HOST
+# (run `stat -c '%g' /var/run/docker.sock` on the host to find it; 999 is
+# the common default on Debian/Ubuntu). This lets the non-root "app" user
+# read/write the bind-mounted socket without running the container as root.
+ARG DOCKER_GID=999
+RUN apk add --no-cache openssl curl tini \
+  && addgroup -S app \
+  && adduser -S app -G app \
+  && EXISTING_GRP="$(awk -F: -v gid="${DOCKER_GID}" '$3==gid {print $1}' /etc/group)" \
+  && if [ -z "$EXISTING_GRP" ]; then addgroup -g "${DOCKER_GID}" docker; EXISTING_GRP=docker; fi \
+  && adduser app "${EXISTING_GRP}"
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/prisma ./prisma
+COPY --from=build /app/dist ./dist
+COPY package.json ./
+
+# Server-owned bind mounts (SERVERS_ROOT / BACKUPS_ROOT) are created and
+# owned by whatever the host maps in; the app itself runs as non-root but
+# in the "docker" group so it can use the bind-mounted docker.sock.
+USER app
+
+EXPOSE 4000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fs http://localhost:4000/api/health || exit 1
+
+# tini as PID 1 for correct signal handling (SIGTERM -> graceful shutdown)
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/main.js"]
