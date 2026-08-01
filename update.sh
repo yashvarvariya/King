@@ -34,6 +34,8 @@ PROTECTED_PATHS=(
   "uploads"
   "branding"
   "update-system"
+  "update.sh"
+  "UPDATE.md"
 )
 
 TS="$(date +%Y%m%d-%H%M%S)"
