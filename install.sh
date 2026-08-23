@@ -460,12 +460,121 @@ render_nginx() {
 }
 
 # ============================================================================
-# Step 7: Build images
+# Step 7: Build images (self-healing: diagnose -> remediate -> retry)
 # ============================================================================
+MAX_BUILD_RETRIES=2   # total attempts = 1 + this, so the loop can't run forever
+BUILD_LOG_DIR="/var/log/bot-hosting-panel-build-logs"
+
+# Ensure a Node.js/npm toolchain exists on the HOST so we can safely
+# regenerate a lockfile with `npm install --package-lock-only`. This never
+# installs project dependencies on the host and never touches node_modules
+# — it only recomputes package-lock.json from package.json.
+ensure_node_npm() {
+  if command -v npm >/dev/null 2>&1; then
+    return 0
+  fi
+  c_yellow "  npm not found on host — installing Node.js LTS (needed only to repair package-lock.json)..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 \
+    && apt-get install -y -qq nodejs >/dev/null 2>&1
+  command -v npm >/dev/null 2>&1
+}
+
+# Regenerate package-lock.json so it matches package.json, without touching
+# node_modules or installing anything into the project. Always backs up the
+# existing lock file first (never blindly deletes it).
+remediate_lockfile_sync() {
+  local dir="$1"
+  [ -f "${dir}/package.json" ] || return 1
+  ensure_node_npm || { c_yellow "  Could not install npm on host — skipping lockfile repair for ${dir}."; return 1; }
+
+  local backup="${dir}/package-lock.json.bak.$(date +%Y%m%d-%H%M%S)"
+  if [ -f "${dir}/package-lock.json" ]; then
+    cp "${dir}/package-lock.json" "$backup"
+    echo "  Backed up ${dir}/package-lock.json -> ${backup}"
+  fi
+
+  echo "  Regenerating ${dir}/package-lock.json from ${dir}/package.json (package-lock-only, no install)..."
+  ( cd "$dir" && npm install --package-lock-only --no-audit --no-fund ) \
+    || { c_yellow "  Lockfile regeneration failed for ${dir}."; return 1; }
+
+  echo "  ${dir}/package-lock.json is now in sync with package.json."
+  return 0
+}
+
+# Look at a captured build log and classify the failure. Echoes one of:
+# lockfile_sync | network | prisma | unknown
+diagnose_build_failure() {
+  local log_file="$1"
+  if grep -qiE "npm (ci|install).*(can only install|in sync|EUSAGE)|lock file.*out of sync" "$log_file" 2>/dev/null \
+     || grep -qE "npm error code EUSAGE" "$log_file" 2>/dev/null; then
+    echo "lockfile_sync"
+  elif grep -qiE "ENOTFOUND registry|ETIMEDOUT|network.*(timeout|unreachable)|getaddrinfo|E403|429 Too Many Requests" "$log_file" 2>/dev/null; then
+    echo "network"
+  elif grep -qiE "prisma (generate|migrate).*(error|failed)|Error: P[0-9]{4}" "$log_file" 2>/dev/null; then
+    echo "prisma"
+  else
+    echo "unknown"
+  fi
+}
+
 build_images() {
   step "Building Docker images..."
-  docker compose -f "$COMPOSE_FILE" build api web \
-    || fail "Docker image build failed. Check the output above."
+  mkdir -p "$BUILD_LOG_DIR" 2>/dev/null || BUILD_LOG_DIR="./build-logs"
+  mkdir -p "$BUILD_LOG_DIR" 2>/dev/null || true
+
+  local attempt=0
+  while :; do
+    attempt=$((attempt + 1))
+    local build_log="${BUILD_LOG_DIR}/build-attempt-${attempt}-$(date +%Y%m%d-%H%M%S).log"
+
+    echo "  Attempt ${attempt}/$((MAX_BUILD_RETRIES + 1)): docker compose build api web"
+    # Secrets never touch the build log: `docker compose build` output here
+    # is npm/tsc/docker layer output only, not .env content.
+    if docker compose -f "$COMPOSE_FILE" build api web >"$build_log" 2>&1; then
+      echo "  Build succeeded."
+      log "Docker build succeeded on attempt ${attempt}"
+      return 0
+    fi
+
+    c_yellow "  [7/${TOTAL_STEPS}] Build failed — diagnosing (log: ${build_log})..."
+    log "Docker build failed on attempt ${attempt}, log=${build_log}"
+    local reason
+    reason="$(diagnose_build_failure "$build_log")"
+    echo "  Diagnosis: ${reason}"
+
+    if [ "$attempt" -gt "$MAX_BUILD_RETRIES" ]; then
+      c_red "  Maximum build retries (${MAX_BUILD_RETRIES}) reached."
+      tail -n 40 "$build_log" | sed 's/^/    /'
+      fail "Docker image build failed after ${attempt} attempts (reason: ${reason}). Full log: ${build_log}. Manual fix: for 'lockfile_sync', run 'cd backend && npm install --package-lock-only' (or frontend/) then re-run this installer; for 'network', check outbound access to registry.npmjs.org and re-run; otherwise inspect ${build_log} for the exact npm/tsc error."
+    fi
+
+    case "$reason" in
+      lockfile_sync)
+        c_yellow "  [7/${TOTAL_STEPS}] Applying safe remediation: regenerating out-of-sync package-lock.json..."
+        local fixed=0
+        remediate_lockfile_sync "${INSTALL_DIR}/backend" && fixed=1
+        remediate_lockfile_sync "${INSTALL_DIR}/frontend" && fixed=1
+        if [ "$fixed" -eq 0 ]; then
+          fail "Detected a package.json/package-lock.json mismatch but could not repair it automatically (no npm available and none could be installed). Full log: ${build_log}. Manual fix: install Node.js, then run 'npm install --package-lock-only' in backend/ (and frontend/ if affected), then re-run this installer."
+        fi
+        ;;
+      network)
+        c_yellow "  [7/${TOTAL_STEPS}] Looks like a registry/network hiccup — verifying connectivity and retrying..."
+        curl -fsS --max-time 5 https://registry.npmjs.org/ >/dev/null 2>&1 \
+          || c_yellow "  Warning: registry.npmjs.org still not reachable from this host."
+        sleep 5
+        ;;
+      prisma)
+        fail "Prisma generate/migrate failed during the build (not something the installer can safely auto-repair — it usually means the Prisma schema and a migration are out of sync). Full log: ${build_log}. Manual fix: review backend/prisma/schema.prisma and backend/prisma/migrations, then re-run."
+        ;;
+      unknown)
+        fail "Docker image build failed for an unrecognized reason — not auto-repairing to avoid masking a real bug. Full log: ${build_log}. Manual fix: inspect the log above for the first 'error' line (often an npm or tsc error) and address it directly."
+        ;;
+    esac
+
+    c_yellow "  [7/${TOTAL_STEPS}] Retrying Docker build..."
+    log "Retrying Docker build after ${reason} remediation (attempt $((attempt + 1)) next)"
+  done
 }
 
 # ============================================================================

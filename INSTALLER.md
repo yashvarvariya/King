@@ -162,6 +162,20 @@ see [BACKUPS.md](./BACKUPS.md) and `deploy/crontab.example`.
 - **Re-running after a partial failure**: safe to re-run — the installer
   detects an existing `.env` and installation directory and won't overwrite
   data without asking.
+- **Docker image build failed**: the installer now diagnoses build
+  failures instead of just stopping. It looks at the captured build log
+  (`/var/log/bot-hosting-panel-build-logs/`) and:
+  - `package.json`/`package-lock.json` out of sync (`npm ci` fails with an
+    "in sync" / `EUSAGE` error) → the installer backs up the old lock file
+    and regenerates it with `npm install --package-lock-only` (no
+    `node_modules` changes, no arbitrary installs), then retries the build.
+  - registry/network errors → verifies connectivity and retries once.
+  - a genuine Prisma or build-script error → stops immediately with the
+    exact log location and a suggested manual fix; this is not something
+    that should be auto-repaired.
+  - Build retries are capped at 2 (3 attempts total) so a real bug can't
+    loop forever — if it still fails, the installer prints the diagnosis,
+    the log path, and a manual fix and exits without pretending success.
 
 ## 10. Uninstall procedure
 

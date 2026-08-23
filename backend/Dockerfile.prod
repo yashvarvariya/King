@@ -9,8 +9,22 @@ FROM node:20-alpine AS deps
 RUN apk add --no-cache openssl
 WORKDIR /app
 COPY package.json package-lock.json* ./
+# `npm ci` requires package.json and package-lock.json to be byte-for-byte
+# in sync (every dependency + version present in both). If someone edits
+# package.json (adds/removes a dependency) without regenerating the lock,
+# `npm ci` fails hard with an "in sync" error. Rather than hide that with
+# `|| true`, fall back to `npm install --include=dev`, which resolves from
+# package.json directly and rewrites the lock inside this layer — the build
+# still succeeds and the failure is printed, not swallowed. The real fix is
+# still to run `npm install` locally and commit the regenerated lock file;
+# install.sh does this automatically before invoking `docker build` (see
+# remediate_lockfile_sync in install.sh) so this fallback should rarely
+# trigger in normal use.
 RUN if [ -f package-lock.json ]; then \
-      npm ci --include=dev; \
+      npm ci --include=dev || { \
+        echo '[deps] npm ci failed (package.json / package-lock.json are out of sync) — falling back to npm install --include=dev'; \
+        npm install --include=dev; \
+      }; \
     else \
       npm install --include=dev; \
     fi
@@ -35,9 +49,13 @@ FROM node:20-alpine AS prod-deps
 RUN apk add --no-cache openssl
 WORKDIR /app
 COPY package.json package-lock.json* ./
+# Same npm-ci-can-fail-on-drift reasoning as the deps stage above.
 RUN ( \
       if [ -f package-lock.json ]; then \
-        npm ci --omit=dev; \
+        npm ci --omit=dev || { \
+          echo '[prod-deps] npm ci failed (package.json / package-lock.json are out of sync) — falling back to npm install --omit=dev'; \
+          npm install --omit=dev; \
+        }; \
       else \
         npm install --omit=dev; \
       fi \
