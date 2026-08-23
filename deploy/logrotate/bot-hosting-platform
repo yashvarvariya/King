@@ -1,0 +1,27 @@
+# Host-level logrotate config.
+# Install with:
+#   sudo cp deploy/logrotate/bot-hosting-platform /etc/logrotate.d/bot-hosting-platform
+#
+# NOTE: docker-compose.prod.yml already sets each service's `logging` driver
+# to json-file with max-size/max-file, which bounds *container* stdout/stderr
+# logs on its own. This file additionally rotates:
+#   - the application's own log files, if you redirect stdout to disk instead
+#     of relying purely on `docker logs` (e.g. via a systemd unit wrapper)
+#   - nginx access/error logs when nginx is run directly on the host instead
+#     of in the provided container (the container's own logs are covered by
+#     the json-file driver above)
+
+/var/log/bot-hosting-platform/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    sharedscripts
+    postrotate
+        # Reload nginx if it's running directly on the host (no-op otherwise)
+        [ -f /var/run/nginx.pid ] && kill -USR1 "$(cat /var/run/nginx.pid)" 2>/dev/null || true
+    endscript
+}

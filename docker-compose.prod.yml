@@ -1,0 +1,179 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Production compose file. Differences from docker-compose.yml (dev/default):
+#   - Uses Dockerfile.prod (multi-stage, non-root, smaller images) for both
+#     api and web.
+#   - Nginx terminates HTTPS (port 443) using Let's Encrypt certs managed by
+#     the certbot sidecar, and redirects port 80 -> 443.
+#   - api/web no longer publish ports directly to the host; only Nginx is
+#     exposed, reducing attack surface.
+#   - Container-level healthchecks and json-file log rotation everywhere.
+#   - Read run: `./scripts/render-nginx-prod.sh` once before first `up` (see
+#     DEPLOYMENT.md) so nginx/nginx.prod.rendered.conf exists.
+# ---------------------------------------------------------------------------
+
+networks:
+  platform:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  certbot_certs:
+  certbot_www:
+  branding_uploads:
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-platform}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [platform]
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-platform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks: [platform]
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+      args:
+        DOCKER_GID: ${DOCKER_GID:-999}
+    image: bot-hosting-api:${RELEASE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-platform}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      PORT: 4000
+      SERVERS_ROOT: ${SERVERS_ROOT:?SERVERS_ROOT must be set}
+      BACKUPS_ROOT: ${BACKUPS_ROOT:?BACKUPS_ROOT must be set}
+      DOCKER_SOCKET: /var/run/docker.sock
+      CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN must be set}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SERVERS_ROOT:-/srv/bot-hosting/servers}:${SERVERS_ROOT:-/srv/bot-hosting/servers}
+      - ${BACKUPS_ROOT:-/srv/bot-hosting/backups}:${BACKUPS_ROOT:-/srv/bot-hosting/backups}
+      - branding_uploads:/app/uploads
+    networks: [platform]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:4000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL must be set}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:?NEXT_PUBLIC_WS_URL must be set}
+    image: bot-hosting-web:${RELEASE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL}
+    networks: [platform]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    volumes:
+      - ./nginx/nginx.prod.rendered.conf:/etc/nginx/nginx.conf:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks: [platform]
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    volumes:
+      - certbot_certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    # Renews twice a day (certbot no-ops unless within 30 days of expiry),
+    # then sleeps. Initial certificate issuance is a one-off manual step —
+    # see DEPLOYMENT.md "Obtaining your first certificate".
+    entrypoint: >
+      /bin/sh -c "trap exit TERM;
+      while :; do certbot renew --webroot -w /var/www/certbot --quiet;
+      sleep 12h & wait $${!}; done"
+    networks: [platform]
+    logging: *default-logging

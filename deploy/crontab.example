@@ -1,0 +1,15 @@
+# Example host crontab for bot-hosting-platform.
+# Install with: crontab -e   (as the user that owns the deployment directory)
+#
+# Adjust the path /opt/bot-hosting-platform to wherever you cloned the repo.
+
+# Daily infrastructure backup (DB dump + server files) at 03:00, 14-day retention
+0 3 * * * BACKUP_DEST=/mnt/offsite-backups RETENTION_DAYS=14 /opt/bot-hosting-platform/scripts/backup-cron.sh >> /var/log/bot-hosting-platform/backup.log 2>&1
+
+# Weekly Docker image / build cache prune, Sunday 04:30 (keeps disk usage bounded)
+30 4 * * 0 docker system prune -af --filter "until=168h" >> /var/log/bot-hosting-platform/docker-prune.log 2>&1
+
+# Note: certificate renewal does NOT need a cron entry — the `certbot`
+# service in docker-compose.prod.yml already loops internally every 12h.
+# This entry is only needed if you run certbot directly on the host instead:
+# 0 */12 * * * certbot renew --quiet --deploy-hook "docker compose -f /opt/bot-hosting-platform/docker-compose.prod.yml exec -T nginx nginx -s reload"

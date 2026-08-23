@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  background-color: var(--color-base-950, #0a0f0d);
+  color: #e7f2ec;
+}
+
+body {
+  font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
+
+::selection {
+  background-color: #3fe07d;
+  color: #0a0f0d;
+}
+
+/* thin scrollbars for console/file panes */
+.scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: #324338; border-radius: 4px; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.status-dot-running { animation: pulse-dot 2s ease-in-out infinite; }
+
+/* Landing page hero background blobs (see components/landing/Hero.tsx) */
+.hero-blob {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(80px);
+  opacity: 0.35;
+}
+.hero-blob-1 {
+  width: 420px; height: 420px; top: -140px; left: -100px;
+  background: radial-gradient(circle, #5eff9a, transparent 70%);
+  animation: hero-drift-1 18s ease-in-out infinite;
+}
+.hero-blob-2 {
+  width: 380px; height: 380px; top: -80px; right: -120px;
+  background: radial-gradient(circle, #22d3ee, transparent 70%);
+  animation: hero-drift-2 22s ease-in-out infinite;
+}
+@keyframes hero-drift-1 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(40px, 30px) scale(1.08); }
+}
+@keyframes hero-drift-2 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-30px, 40px) scale(1.05); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-blob-1, .hero-blob-2 { animation: none; }
+}

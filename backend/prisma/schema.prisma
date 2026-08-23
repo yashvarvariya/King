@@ -1,0 +1,461 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum ServerStatus {
+  INSTALLING
+  OFFLINE
+  RUNNING
+  STOPPING
+  SUSPENDED
+  ERRORED
+}
+
+enum Runtime {
+  NODEJS
+  PYTHON
+}
+
+enum OtpPurpose {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  EMAIL_CHANGE
+}
+
+enum PlanBadge {
+  NONE
+  FREE
+  MOST_POPULAR
+  BEST_VALUE
+  NEW
+  LIMITED_OFFER
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+  CANCELLED
+}
+
+enum BillingAction {
+  CREATED
+  ACTIVATED
+  PLAN_CHANGED
+  EXTENDED
+  SUSPENDED
+  UNSUSPENDED
+  CANCELLED
+  EXPIRED
+  RENEWED
+}
+
+enum BillingNotificationType {
+  ACTIVATED
+  EXPIRING_SOON
+  EXPIRED
+  RENEWED
+  SUSPENDED
+  UNSUSPENDED
+}
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  // Set while an email change is awaiting OTP confirmation at the new
+  // address (see UsersService.requestEmailChange/confirmEmailChange).
+  // `email` itself is only overwritten once ownership of the new address
+  // is proven, so a change request never locks a user out of their
+  // existing, still-valid login email.
+  pendingEmail  String?
+  username      String   @unique
+  passwordHash  String
+  role          Role     @default(USER)
+  suspended     Boolean  @default(false)
+  emailVerified Boolean  @default(false)
+  sessionVersion Int     @default(0)
+
+  // Free / Premium plan
+  isPremium     Boolean  @default(false)
+  premiumSince  DateTime?
+  // Last time this user was seen making an authenticated request. Drives the
+  // Free-plan 5-consecutive-day inactivity auto-stop.
+  lastActiveAt  DateTime @default(now())
+
+  // quotas
+  maxServers    Int      @default(2)
+  maxDiskMb     Int      @default(1024)
+  maxMemoryMb   Int      @default(512)
+  maxCpuPercent Int      @default(100)
+  backupLimit   Int      @default(5)
+
+  servers            Server[]
+  emailOtps           EmailOtp[]
+  refreshTokens       RefreshToken[]
+  emailLogs           EmailLog[]
+  subscription        Subscription?
+  billingHistory      BillingHistory[]
+  billingNotifications BillingNotification[]
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// Single-purpose 6-digit OTP model backing both email verification and
+// forgot-password resets. Only the hash of the code is ever stored.
+model EmailOtp {
+  id          String     @id @default(uuid())
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      String
+  purpose     OtpPurpose
+  codeHash    String
+  attempts    Int        @default(0)
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  lastSentAt  DateTime   @default(now())
+  createdAt   DateTime   @default(now())
+
+  @@index([userId, purpose])
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  tokenHash  String   @unique
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  rememberMe Boolean  @default(false)
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Server {
+  id              String       @id @default(uuid())
+  name            String
+  description     String?
+  status          ServerStatus @default(INSTALLING)
+  runtime         Runtime
+  startupCommand  String?
+  containerId     String?
+  containerName   String       @unique
+
+  // Optional Runtime Manager catalog reference — see the model comments
+  // above. Null on every server created before this feature existed;
+  // DockerService falls back to the legacy `runtime` -> hardcoded image
+  // map whenever runtimeVersionId isn't set.
+  runtimeEngineId  String?
+  runtimeVersionId String?
+
+  memoryLimitMb   Int          @default(512)
+  cpuLimitPercent Int          @default(100)
+  diskLimitMb     Int          @default(1024)
+
+  autoRestart     Boolean      @default(true)
+  suspended       Boolean      @default(false)
+
+  autoBackupEnabled Boolean    @default(false)
+  backupRetention   Int        @default(5)
+
+  owner           User         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  ownerId         String
+
+  envVars         EnvVar[]
+  backups         Backup[]
+
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@index([ownerId])
+}
+
+model EnvVar {
+  id        String   @id @default(uuid())
+  key       String
+  value     String
+  server    Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  serverId  String
+
+  @@unique([serverId, key])
+}
+
+model Backup {
+  id         String   @id @default(uuid())
+  fileName   String
+  sizeBytes  BigInt
+  server     Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  serverId   String
+  createdAt  DateTime @default(now())
+}
+
+// Single-row table (id is always the literal string "singleton") holding the
+// admin-configured SMTP connection used to actually deliver mail. When absent
+// (or host is empty) MailService falls back to the SMTP_* env vars, and if
+// neither is set, falls back further to logging emails to the console — so
+// self-hosted installs keep working end-to-end before anyone touches Settings.
+model EmailSmtpSettings {
+  id           String   @id @default("singleton")
+  host         String?
+  port         Int      @default(587)
+  secure       Boolean  @default(false)
+  username     String?
+  password     String?
+  senderName   String   @default("Bot Hosting Platform")
+  senderEmail  String?
+  updatedAt    DateTime @updatedAt
+  updatedById  String?
+}
+
+// Admin-editable content for every transactional email the platform sends.
+// `type` is the stable key routes use to look the template up (e.g.
+// "email_verification_otp"); {{variable}} placeholders are substituted by
+// MailService at send time. Seeded with sane defaults — see prisma/seed.ts.
+model EmailTemplate {
+  id          String   @id @default(uuid())
+  type        String   @unique
+  subject     String
+  title       String
+  body        String
+  footer      String   @default("")
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+}
+
+// Append-only record of every send attempt (sent / skipped / failed), shown
+// in Admin > Email Settings > Logs so an admin can tell whether mail is
+// actually going out without digging through server logs.
+model EmailLog {
+  id        String   @id @default(uuid())
+  type      String
+  toEmail   String
+  status    String   // "sent" | "skipped" | "failed"
+  error     String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId    String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([userId])
+}
+
+// Single-row table controlling which email domains are allowed to register
+// (disposable/"temporary email" blocking). An empty allowList means "allow
+// anything not explicitly blocked" so an admin can run blocklist-only mode.
+model EmailValidationSettings {
+  id             String   @id @default("singleton")
+  enabled        Boolean  @default(true)
+  allowedDomains String[] @default([])
+  blockedDomains String[] @default([])
+  updatedAt      DateTime @updatedAt
+  updatedById    String?
+}
+
+// Single-row table (id is always the literal string "singleton") holding
+// site-wide white-label branding + the maintenance-mode flag. Read publicly
+// (no auth) so login/register/dashboard can render it before a session
+// exists; written only by admins.
+model Branding {
+  id                  String   @id @default("singleton")
+  hostingName         String   @default("Kerit Panel")
+  logoUrl             String?
+  faviconUrl          String?
+  browserTitle        String   @default("Kerit Panel")
+  footerText          String   @default("Powered by Kerit Panel")
+  discordInvite       String?
+  supportEmail        String?
+  themeColor          String   @default("#5eff9a")
+  secondaryThemeColor String   @default("#0a0f0d")
+  backgroundImageUrl  String?
+  maintenanceMode     Boolean  @default(false)
+  updatedAt           DateTime @updatedAt
+}
+
+// ---- Pricing Manager -------------------------------------------------
+// Admin-editable plan catalog (Admin > Pricing Manager). ram/storage/cpu/
+// maxServers stay free-form strings (e.g. "2 GB", "Unlimited") to match
+// the storefront copy admins type in — BillingService parses them into the
+// numeric User quota columns (maxMemoryMb/maxDiskMb/maxCpuPercent/
+// maxServers) whenever a subscription is assigned/changed so a plan
+// actually grants the resources it advertises.
+model Plan {
+  id           String    @id
+  name         String    @unique
+  description  String    @default("")
+  oldPrice     Float?
+  price        Float     @default(0)
+  ram          String
+  storage      String
+  cpu          String
+  maxServers   String    @default("1")
+  lifetime     Boolean   @default(false)
+  active       Boolean   @default(true)
+  displayOrder Int       @default(0)
+  badge        PlanBadge @default(NONE)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// ---- Manual billing system ---------------------------------------------
+// One row per user holding their current plan/status; BillingHistory below
+// is the append-only audit trail of how it got there. planId is a loose
+// reference to Plan.id (no DB-level FK) on purpose: deleting a plan is
+// blocked at the service layer while any subscription still references it,
+// but a hard FK constraint isn't used so that guard stays an application
+// decision rather than a database one, matching the original design.
+model Subscription {
+  id             String             @id @default(uuid())
+  user           User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String             @unique
+  planId         String             @default("free")
+  status         SubscriptionStatus @default(ACTIVE)
+  activationDate DateTime           @default(now())
+  expiryDate     DateTime? // null = never expires (free/lifetime plans)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  history BillingHistory[]
+
+  @@index([planId])
+  @@index([status])
+}
+
+model BillingHistory {
+  id             String        @id @default(uuid())
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  subscriptionId String?
+  action         BillingAction
+  fromPlan       String?
+  toPlan         String?
+  note           String?
+  performedBy    String? // admin user id; null = system-performed (auto-expiry, sweep)
+  createdAt      DateTime      @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model BillingNotification {
+  id        String                  @id @default(uuid())
+  user      User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  type      BillingNotificationType
+  message   String
+  read      Boolean                 @default(false)
+  createdAt DateTime                @default(now())
+
+  @@index([userId, read])
+}
+
+// Single-row table (id is always the literal string "singleton") for
+// manually-entered revenue figures — there's no payment gateway wired up
+// (purchases are verified by hand, e.g. over Discord), so revenue is
+// whatever an admin types in rather than something computed from charges.
+model BillingStats {
+  id             String   @id @default("singleton")
+  totalRevenue   Float    @default(0)
+  monthlyRevenue Float    @default(0)
+  updatedAt      DateTime @updatedAt
+  updatedById    String?
+}
+
+// ---- Runtime Manager -----------------------------------------------------
+// Admin-editable runtime/version catalog (Admin > Runtime Manager), the
+// same DB-driven-catalog shape as Plan above. The platform is Docker-based
+// (unlike the original single-host process manager this was ported from),
+// so RuntimeEngineVersion.image is a Docker image tag rather than a path to
+// a locally-installed binary — that's the one deliberate adaptation; admins
+// otherwise get the same "add a version, enable/disable, set a default,
+// no deploy needed" workflow.
+//
+// `family` ties every engine to one of the two hardcoded startup-command
+// conventions ServersService already knows (npm install/node vs.
+// pip install/python) — deterministic, so a server's shell entrypoint
+// never has to be guessed from a display name.
+//
+// Server.runtimeEngineId/runtimeVersionId are additive and optional: existing
+// servers (created before this feature existed) simply have both null and
+// keep working exactly as before, off the original hardcoded
+// NODEJS/PYTHON -> node:20-alpine/python:3.12-alpine mapping in
+// DockerService. Only new servers that go through the catalog picker get
+// these set. No FK at the DB level (same reasoning as Plan.planId) — a
+// version can be safely retired while guarding deletion at the service
+// layer as long as any server still references it.
+model RuntimeEngine {
+  id           String   @id
+  name         String   @unique
+  icon         String   @default("")
+  description  String   @default("")
+  family       Runtime  @default(NODEJS)
+  enabled      Boolean  @default(true)
+  displayOrder Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  versions RuntimeEngineVersion[]
+}
+
+model RuntimeEngineVersion {
+  id              String        @id @default(uuid())
+  runtimeEngine   RuntimeEngine @relation(fields: [runtimeEngineId], references: [id], onDelete: Cascade)
+  runtimeEngineId String
+  version         String
+  image           String
+  enabled         Boolean       @default(true)
+  displayOrder    Int           @default(0)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([runtimeEngineId, version])
+}
+
+model RuntimeDefaults {
+  id                      String   @id @default("singleton")
+  defaultRuntimeEngineId  String?
+  defaultRuntimeVersionId String?
+  updatedAt               DateTime @updatedAt
+  updatedById             String?
+}
+
+// ---- Discord Management Bot ---------------------------------------------
+// Single-row settings table, same convention as EmailSmtpSettings/
+// BillingStats/RuntimeDefaults above. botToken/clientId/guildId/
+// ownerDiscordId all being set is what "isConfigured" means — see
+// DiscordBotService. desiredState tracks whether the admin last pressed
+// Start or Stop, so a panel restart can auto-reconnect only if they
+// actually wanted the bot running.
+model DiscordBotSettings {
+  id             String   @id @default("singleton")
+  botToken       String?
+  clientId       String?
+  guildId        String?
+  ownerDiscordId String?
+  desiredState   String   @default("stopped") // 'running' | 'stopped'
+  updatedAt      DateTime @updatedAt
+  updatedById    String?
+}
+
+// Append-only audit trail of every slash command the bot ran (or denied),
+// mirroring the EmailLog pattern.
+model DiscordCommandLog {
+  id              String   @id @default(uuid())
+  discordUserId   String?
+  discordUsername String?
+  command         String
+  status          String // success | error | denied
+  detail          String?
+  createdAt       DateTime @default(now())
+
+  @@index([createdAt])
+}

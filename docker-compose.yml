@@ -1,0 +1,94 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Kerit-style self-hosted Bot Hosting Platform
+# Core stack: Postgres + Redis + NestJS API + Next.js panel + Nginx
+# Every user-deployed bot runs in its OWN container, created at runtime by
+# the API through the Docker Engine socket (see backend/src/docker).
+# ---------------------------------------------------------------------------
+
+networks:
+  platform:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  branding_uploads:
+  # NOTE: server_data/backup_data are intentionally NOT named volumes.
+  # The API container calls the HOST's Docker daemon (via the socket) to
+  # create one container per bot, and that daemon resolves bind-mount
+  # sources against the HOST filesystem — not paths inside the API
+  # container. So the API container mounts these directories at the exact
+  # same absolute path as on the host (source == destination), letting it
+  # pass that identical path straight through to dockerode's `Binds`.
+  # See SERVERS_ROOT / BACKUPS_ROOT below and in .env.example.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-platform}
+      POSTGRES_DB: ${POSTGRES_DB:-platform}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [platform]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - platform
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    user: "0:0"
+    group_add:
+      - "988"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform}@postgres:5432/${POSTGRES_DB:-platform}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change_me_super_secret}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      PORT: 4000
+      SERVERS_ROOT: ${SERVERS_ROOT:-/srv/bot-hosting/servers}
+      BACKUPS_ROOT: ${BACKUPS_ROOT:-/srv/bot-hosting/backups}
+      DOCKER_SOCKET: /var/run/docker.sock
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-Bot Hosting Platform <no-reply@localhost>}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SERVERS_ROOT:-/srv/bot-hosting/servers}:${SERVERS_ROOT:-/srv/bot-hosting/servers}
+      - ${BACKUPS_ROOT:-/srv/bot-hosting/backups}:${BACKUPS_ROOT:-/srv/bot-hosting/backups}
+      - branding_uploads:/app/uploads
+    ports:
+      - "4000:4000"
+    networks:
+      - platform
