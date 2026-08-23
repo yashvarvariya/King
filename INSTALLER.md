@@ -163,19 +163,42 @@ see [BACKUPS.md](./BACKUPS.md) and `deploy/crontab.example`.
   detects an existing `.env` and installation directory and won't overwrite
   data without asking.
 - **Docker image build failed**: the installer now diagnoses build
-  failures instead of just stopping. It looks at the captured build log
-  (`/var/log/bot-hosting-panel-build-logs/`) and:
+  failures instead of just stopping. Before building it runs
+  `docker compose config` to catch a bad/incomplete `.env` immediately. It
+  looks at the captured build log (`/var/log/bot-hosting-panel-build-logs/`)
+  and prints the exact `npm error` / `tsc` / Prisma error lines — never just
+  "build failed" — then classifies and auto-repairs where it's safe to:
   - `package.json`/`package-lock.json` out of sync (`npm ci` fails with an
-    "in sync" / `EUSAGE` error) → the installer backs up the old lock file
-    and regenerates it with `npm install --package-lock-only` (no
-    `node_modules` changes, no arbitrary installs), then retries the build.
-  - registry/network errors → verifies connectivity and retries once.
-  - a genuine Prisma or build-script error → stops immediately with the
-    exact log location and a suggested manual fix; this is not something
-    that should be auto-repaired.
+    "in sync" / `EUSAGE` error) → backs up the old lock file and
+    regenerates it with `npm install --package-lock-only` (no
+    `node_modules` changes, no arbitrary installs), then retries.
+  - disk full (`ENOSPC`) → runs `docker builder prune --force` (scoped to
+    build cache only — never `docker system prune -a`) and retries.
+  - registry/network errors → verifies connectivity and retries.
+  - a permission error or a genuine Prisma/build-script error → stops
+    immediately with the exact log location and a suggested manual fix;
+    these are not auto-repaired since guessing could mask a real bug.
+  - Every retry after the first also passes `--no-cache` so a bad cached
+    layer from the failed attempt can't be reused.
   - Build retries are capped at 2 (3 attempts total) so a real bug can't
     loop forever — if it still fails, the installer prints the diagnosis,
-    the log path, and a manual fix and exits without pretending success.
+    the exact error lines, the log path, and a manual fix, and exits
+    non-zero without pretending success.
+- **Preflight validation**: before touching secrets or Docker, the
+  installer checks that every required project file exists and is
+  non-empty (compose file, both Dockerfiles, package.json/lock files,
+  Prisma schema, Nginx config, scripts), regenerates
+  `.env.production.example` from `.env.example` if it's missing, and
+  checks write permissions on the install dir, log dir, and Docker socket.
+- **"Repair" vs "Update"**: re-running `install.sh` against an existing
+  install offers Update (hands off to `update.sh`: pull, migrate, restart)
+  or Repair (reuses the existing `.env`, then re-runs preflight, build
+  — with the same self-healing above — start, migrate, and seed; the
+  admin seed is idempotent and never overwrites an existing admin).
+- **"SUCCESS" is never printed unconditionally**: the final summary only
+  reports success once containers are running AND Postgres, Redis, and the
+  API health endpoint all responded to real checks. If anything didn't
+  pass, it says so explicitly instead of claiming a clean install.
 
 ## 10. Uninstall procedure
 
